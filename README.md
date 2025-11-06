@@ -1,4 +1,4 @@
-# Inkcut Launcher
+# Inkcut Windows-Auto
 
 Небольшой лаунчер `run_inkcut.py`, который автоматически подготавливает окружение для запуска [Inkcut](https://www.codelv.com/projects/inkcut/) на Windows.
 
