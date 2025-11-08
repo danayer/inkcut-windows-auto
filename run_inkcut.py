@@ -169,47 +169,68 @@ def is_user_admin() -> bool:
         return False
 
 
-def build_python_download_url(version_str: str) -> str:
+def determine_installer_filename(version_str: str) -> str:
     machine = platform.machine().lower()
     suffix = ""
     if "arm64" in machine or "aarch64" in machine:
         suffix = "-arm64"
     elif "64" in machine:
         suffix = "-amd64"
-    return f"https://www.python.org/ftp/python/{version_str}/python-{version_str}{suffix}.exe"
+    return f"python-{version_str}{suffix}.exe"
 
 
-def download_python_installer(url: str, destination: Path) -> None:
-    LOGGER.info("Downloading Python %s from %s", REQUIRED_VERSION_STR, url)
-    temp_path = destination.with_suffix(".download")
-    last_percent = -1
-    try:
-        with urllib.request.urlopen(url) as response, open(temp_path, "wb") as file:
-            total = int(response.getheader("Content-Length", "0"))
-            downloaded = 0
-            chunk_size = 8192
-            while True:
-                chunk = response.read(chunk_size)
-                if not chunk:
-                    break
-                file.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    percent = int(downloaded * 100 / total)
-                    if percent != last_percent and percent % 5 == 0:
-                        LOGGER.info(
-                            "Downloading Python installer: %d%% (%d/%d KB)",
-                            percent,
-                            downloaded // 1024,
-                            total // 1024,
-                        )
-                        last_percent = percent
-        temp_path.replace(destination)
-        LOGGER.info("Python installer saved to %s", destination)
-    except Exception as exc:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        raise RuntimeError(f"Failed to download Python installer: {exc}") from exc
+def build_python_download_urls(version_str: str) -> Iterable[str]:
+    filename = determine_installer_filename(version_str)
+    mirrors = [
+        "https://www.python.org/ftp/python/{version}/{filename}",
+        "https://download.python.org/ftp/python/{version}/{filename}",
+        "https://mirrors.huaweicloud.com/python/{version}/{filename}",
+    ]
+    seen = set()
+    for template in mirrors:
+        url = template.format(version=version_str, filename=filename)
+        if url not in seen:
+            seen.add(url)
+            yield url
+
+
+def download_python_installer(urls: Iterable[str], destination: Path) -> Path:
+    failures = []
+    for url in urls:
+        LOGGER.info("Downloading Python %s from %s", REQUIRED_VERSION_STR, url)
+        temp_path = destination.with_suffix(".download")
+        last_percent = -1
+        try:
+            with urllib.request.urlopen(url) as response, open(temp_path, "wb") as file:
+                total = int(response.getheader("Content-Length", "0"))
+                downloaded = 0
+                chunk_size = 8192
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    file.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        percent = int(downloaded * 100 / total)
+                        if percent != last_percent and percent % 5 == 0:
+                            LOGGER.info(
+                                "Downloading Python installer: %d%% (%d/%d KB)",
+                                percent,
+                                downloaded // 1024,
+                                total // 1024,
+                            )
+                            last_percent = percent
+            temp_path.replace(destination)
+            LOGGER.info("Python installer saved to %s", destination)
+            return destination
+        except Exception as exc:
+            failures.append((url, exc))
+            LOGGER.warning("Download from %s failed: %s", url, exc)
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+    messages = ", ".join(f"{url} ({error})" for url, error in failures)
+    raise RuntimeError(f"Failed to download Python installer from all mirrors: {messages}")
 
 
 def run_python_installer(installer_path: Path) -> None:
@@ -255,6 +276,54 @@ def run_python_installer(installer_path: Path) -> None:
     LOGGER.info("Python installation finished.")
 
 
+def prompt_for_local_installer(expected_filename: str) -> Optional[Path]:
+    message = (
+        "Unable to download Python 3.9.13 automatically.\n"
+        f"Click OK and select {expected_filename}."
+    )
+    try:
+        ctypes.windll.user32.MessageBoxW(  # type: ignore[attr-defined]
+            None,
+            message,
+            "Inkcut Launcher",
+            0x00000040,  # MB_ICONINFORMATION
+        )
+    except Exception:
+        LOGGER.info("Message box unavailable; continuing with file selection dialog.")
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        LOGGER.error("Tkinter is unavailable for manual installer selection: %s", exc)
+        return None
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        selected = filedialog.askopenfilename(
+            title="Select Python installer",
+            filetypes=[("Python Installer", expected_filename), ("Executables", "*.exe")],
+        )
+    finally:
+        root.destroy()
+
+    if not selected:
+        LOGGER.warning("User canceled installer selection.")
+        return None
+
+    installer_path = Path(selected)
+    if not installer_path.exists():
+        LOGGER.error("Installer %s does not exist.", installer_path)
+        return None
+
+    if installer_path.name.lower() != expected_filename.lower():
+        LOGGER.error("Selected %s, expected %s.", installer_path.name, expected_filename)
+        return None
+
+    return installer_path
+
+
 def wait_for_python_install(required_version: Tuple[int, int, int], timeout_seconds: int = 300) -> Optional[Path]:
     LOGGER.info("Validating Python installation...")
     deadline = time.time() + timeout_seconds
@@ -269,21 +338,29 @@ def wait_for_python_install(required_version: Tuple[int, int, int], timeout_seco
 
 def install_python() -> Path:
     base_temp_dir = Path(tempfile.mkdtemp(prefix="inkcut_python_"))
-    installer_path = base_temp_dir.joinpath(f"python-{REQUIRED_VERSION_STR}.exe")
+    installer_filename = determine_installer_filename(REQUIRED_VERSION_STR)
+    downloaded_installer_path = base_temp_dir.joinpath(installer_filename)
+    installer_to_use: Optional[Path] = None
     try:
-        download_url = build_python_download_url(REQUIRED_VERSION_STR)
-        download_python_installer(download_url, installer_path)
-        run_python_installer(installer_path)
+        download_urls = list(build_python_download_urls(REQUIRED_VERSION_STR))
+        try:
+            installer_to_use = download_python_installer(download_urls, downloaded_installer_path)
+        except RuntimeError as download_error:
+            LOGGER.error("Automatic download failed for all mirrors: %s", download_error)
+            installer_to_use = prompt_for_local_installer(installer_filename)
+            if not installer_to_use:
+                raise RuntimeError("Python installer was not provided by the user.") from download_error
+        run_python_installer(installer_to_use)
         installed_path = wait_for_python_install(REQUIRED_VERSION)
         if not installed_path:
             raise RuntimeError("Python installation was not detected after setup.")
         return installed_path
     finally:
         try:
-            if installer_path.exists():
-                installer_path.unlink()
+            if downloaded_installer_path.exists():
+                downloaded_installer_path.unlink()
         except Exception:
-            LOGGER.warning("Unable to remove installer %s", installer_path)
+            LOGGER.warning("Unable to remove installer %s", downloaded_installer_path)
         shutil.rmtree(base_temp_dir, ignore_errors=True)
 
 
